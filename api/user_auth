@@ -1,1 +1,195 @@
+<?php
+// api/user_auth.php — User register / verify / login / logout / invite / validate
+require_once __DIR__ . '/../includes/config.php';
 
+$body   = json_decode(file_get_contents('php://input'), true) ?? [];
+$action = $_GET['action'] ?? $body['action'] ?? '';
+
+// ─────────────────────────────────────────────
+//  GET ?action=validate
+// ─────────────────────────────────────────────
+if ($action === 'validate' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    $token = $_SERVER['HTTP_X_SESSION_TOKEN'] ?? ($_COOKIE['ts_user_token'] ?? '');
+    if (!$token) jsonErr('Unauthorized', 401);
+    $row = db()->prepare('SELECT id, name, email FROM users WHERE session_token = ? AND session_expires > NOW() AND is_active = 1 AND is_verified = 1');
+    $row->execute([$token]);
+    $user = $row->fetch();
+    if (!$user) jsonErr('Session expired', 401);
+    jsonOk(['name' => $user['name'], 'email' => $user['email'], 'role' => 'user']);
+}
+
+// ─────────────────────────────────────────────
+//  POST ?action=register
+// ─────────────────────────────────────────────
+if ($action === 'register' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $name   = trim($body['name']   ?? '');
+    $email  = trim($body['email']  ?? '');
+    $pass   = trim($body['pass']   ?? $body['password'] ?? '');
+    $pass2  = trim($body['pass2']  ?? '');
+    $device = trim($body['device'] ?? $body['device_name'] ?? 'Unknown Device');
+
+    if (!$name || !$email || !$pass || !$device) jsonErr('All fields required');
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) jsonErr('Invalid email address');
+    if (strlen($pass) < 8) jsonErr('Password must be at least 8 characters');
+    if ($pass2 !== '' && $pass !== $pass2) jsonErr('Passwords do not match');
+
+    $hash     = password_hash($pass, PASSWORD_BCRYPT, ['cost' => 12]);
+    $token    = 'ts_v_' . generateToken(16);
+    $deviceId = 'ts_d_' . substr(generateToken(8), 0, 8);
+    $expires  = date('Y-m-d H:i:s', time() + 86400);
+
+    try {
+        db()->prepare(
+            'INSERT INTO users (name, email, password_hash, device_name, device_id, verify_token, token_expires)
+             VALUES (?, ?, ?, ?, ?, ?, ?)'
+        )->execute([$name, $email, $hash, $device, $deviceId, $token, $expires]);
+
+        jsonOk([
+            'token'     => $token,
+            'device_id' => $deviceId,
+            'email'     => $email,
+            'msg'       => 'Registration successful.',
+        ]);
+    } catch (PDOException $e) {
+        if ($e->getCode() === '23000') jsonErr('Email already registered');
+        jsonErr('Database error: ' . $e->getMessage());
+    }
+}
+
+// ─────────────────────────────────────────────
+//  POST ?action=verify
+// ─────────────────────────────────────────────
+if ($action === 'verify' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $token = trim($body['token'] ?? '');
+    if (!$token) jsonErr('Verification token required');
+
+    $stmt = db()->prepare(
+        'SELECT * FROM users WHERE verify_token = ? AND token_expires > NOW() AND is_verified = 0'
+    );
+    $stmt->execute([$token]);
+    $user = $stmt->fetch();
+
+    if (!$user) jsonErr('Invalid or expired verification token');
+
+    $sessToken = generateToken(32);
+    $expires   = date('Y-m-d H:i:s', time() + SESSION_LIFETIME);
+
+    db()->prepare(
+        'UPDATE users SET is_verified = 1, verify_token = NULL, token_expires = NULL,
+         tracking_active = 1, session_token = ?, session_expires = ? WHERE id = ?'
+    )->execute([$sessToken, $expires, $user['id']]);
+
+    setcookie('ts_user_token', $sessToken, time() + SESSION_LIFETIME, '/', '', false, true);
+
+    jsonOk([
+        'token'       => $sessToken,
+        'name'        => $user['name'],
+        'email'       => $user['email'],
+        'device_id'   => $user['device_id'],
+        'device_name' => $user['device_name'],
+        'role'        => 'user',
+    ]);
+}
+
+// ─────────────────────────────────────────────
+//  POST ?action=login
+// ─────────────────────────────────────────────
+if ($action === 'login' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $email = trim($body['email'] ?? $_POST['email'] ?? '');
+    $pass  = trim($body['pass']  ?? $_POST['pass']  ?? '');
+
+    if (!$email || !$pass) jsonErr('Email and password required');
+
+    $stmt = db()->prepare('SELECT * FROM users WHERE email = ? AND is_active = 1');
+    $stmt->execute([$email]);
+    $user = $stmt->fetch();
+
+    if (!$user) jsonErr('No account found with this email');
+    if (!$user['is_verified']) jsonErr('Account not verified. Please check your email for the verification token.');
+    if (!password_verify($pass, $user['password_hash'])) jsonErr('Invalid credentials');
+
+    $sessToken = generateToken(32);
+    $expires   = date('Y-m-d H:i:s', time() + SESSION_LIFETIME);
+
+    db()->prepare('UPDATE users SET session_token = ?, session_expires = ?, last_seen = NOW(), tracking_active = 1 WHERE id = ?')
+        ->execute([$sessToken, $expires, $user['id']]);
+
+    setcookie('ts_user_token', $sessToken, time() + SESSION_LIFETIME, '/', '', false, true);
+
+    jsonOk([
+        'token'        => $sessToken,
+        'name'         => $user['name'],
+        'email'        => $user['email'],
+        'device_id'    => $user['device_id'],
+        'device_name'  => $user['device_name'],
+        'role'         => 'user',
+        'last_battery' => $user['last_battery'],
+    ]);
+}
+
+// ─────────────────────────────────────────────
+//  POST ?action=logout
+// ─────────────────────────────────────────────
+if ($action === 'logout' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $user = requireUser();
+    db()->prepare('UPDATE users SET session_token = NULL, session_expires = NULL, tracking_active = 0 WHERE id = ?')
+        ->execute([$user['id']]);
+    setcookie('ts_user_token', '', time() - 3600, '/');
+    jsonOk(['msg' => 'Logged out successfully']);
+}
+
+// ─────────────────────────────────────────────
+//  POST ?action=invite  (admin only)
+// ─────────────────────────────────────────────
+if ($action === 'invite' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    requireAdmin();
+
+    $name     = trim($body['name']     ?? '');
+    $email    = trim($body['email']    ?? '');
+    $device   = trim($body['device']   ?? $body['device_name'] ?? 'Unknown Device');
+    $password = trim($body['password'] ?? '');
+
+    if (!$name || !$email || !$device) jsonErr('Name, email, and device are required');
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) jsonErr('Invalid email address');
+    if (!$password || strlen($password) < 8) jsonErr('Password must be at least 8 characters');
+
+    $hash     = password_hash($password, PASSWORD_BCRYPT, ['cost' => 12]);
+    $token    = 'ts_v_' . generateToken(16);
+    $deviceId = 'ts_d_' . substr(generateToken(8), 0, 8);
+    $expires  = date('Y-m-d H:i:s', time() + 86400 * 7);
+
+    try {
+        $check = db()->prepare('SELECT id, is_verified FROM users WHERE email = ?');
+        $check->execute([$email]);
+        $existing = $check->fetch();
+
+        if ($existing) {
+            if ($existing['is_verified']) jsonErr('A verified account already exists with this email');
+            db()->prepare(
+                'UPDATE users SET name=?, password_hash=?, device_name=?, device_id=?, verify_token=?, token_expires=? WHERE email=?'
+            )->execute([$name, $hash, $device, $deviceId, $token, $expires, $email]);
+        } else {
+            db()->prepare(
+                'INSERT INTO users (name, email, password_hash, device_name, device_id, verify_token, token_expires)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)'
+            )->execute([$name, $email, $hash, $device, $deviceId, $token, $expires]);
+        }
+
+        jsonOk([
+            'token'          => $token,
+            'device_id'      => $deviceId,
+            'email'          => $email,
+            'name'           => $name,
+            'device_name'    => $device,
+            'plain_password' => $password,
+            'verify_link'    => SITE_URL . '/login.php?verify=' . $token,
+            'expires_in'     => '7 days',
+            'msg'            => 'Invitation created.',
+        ]);
+    } catch (PDOException $e) {
+        if ($e->getCode() === '23000') jsonErr('Email already registered');
+        jsonErr('Database error: ' . $e->getMessage());
+    }
+}
+
+jsonErr('Unknown action or method', 400);
