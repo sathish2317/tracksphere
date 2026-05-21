@@ -1,1 +1,159 @@
+<?php
+// api/admin_data.php — All admin dashboard data endpoints
+require_once __DIR__ . '/../includes/config.php';
 
+$action = $_GET['action'] ?? '';
+$admin  = requireAdmin();
+$pdo    = db();
+
+// ── GET ?action=dashboard ──
+if ($action === 'dashboard') {
+    $stats = $pdo->query(
+        'SELECT
+           (SELECT COUNT(*) FROM users WHERE is_verified = 1 AND is_active = 1)                              AS total_users,
+           (SELECT COUNT(*) FROM users WHERE tracking_active = 1 AND last_seen > NOW() - INTERVAL 15 MINUTE) AS online_now,
+           (SELECT COUNT(*) FROM location_logs WHERE recorded_at >= NOW() - INTERVAL 24 HOUR)                AS pings_today,
+           (SELECT COUNT(*) FROM alerts WHERE is_read = 0)                                                    AS unread_alerts'
+    )->fetch();
+
+    $live = $pdo->query(
+        'SELECT u.id, u.name, u.email, u.device_name, u.device_id,
+                u.last_lat, u.last_lng, u.last_battery, u.last_seen, u.tracking_active
+           FROM users u
+          WHERE u.is_verified = 1 AND u.is_active = 1
+          ORDER BY u.last_seen DESC LIMIT 50'
+    )->fetchAll();
+
+    $weekly = $pdo->query(
+        'SELECT DATE(recorded_at) AS day, COUNT(*) AS cnt
+           FROM location_logs
+          WHERE recorded_at >= CURDATE() - INTERVAL 6 DAY
+          GROUP BY DATE(recorded_at)
+          ORDER BY day ASC'
+    )->fetchAll();
+
+    jsonOk(['stats' => $stats, 'live_users' => $live, 'weekly' => $weekly]);
+}
+
+// ── GET ?action=users ──
+if ($action === 'users') {
+    $users = $pdo->query(
+        'SELECT id, name, email, device_name, device_id, is_verified,
+                tracking_active, last_seen, last_lat, last_lng, last_battery, created_at
+           FROM users WHERE is_active = 1 ORDER BY created_at DESC'
+    )->fetchAll();
+    jsonOk(['users' => $users]);
+}
+
+// ── GET ?action=location_log&user_id=X&limit=100 ──
+if ($action === 'location_log') {
+    $uid   = (int)($_GET['user_id'] ?? 0);
+    $limit = min((int)($_GET['limit'] ?? 100), 500);
+    $where = $uid ? 'WHERE l.user_id = ?' : 'WHERE 1=1';
+    $args  = $uid ? [$uid] : [];
+
+    $stmt = $pdo->prepare(
+        "SELECT l.id, l.user_id, l.device_id, l.latitude, l.longitude,
+                l.accuracy_m, l.altitude_m, l.speed_ms, l.battery_pct,
+                l.is_charging, l.network_type, l.recorded_at,
+                u.name AS user_name, u.device_name
+           FROM location_logs l
+           JOIN users u ON u.id = l.user_id
+           $where
+          ORDER BY l.recorded_at DESC
+          LIMIT $limit"
+    );
+    $stmt->execute($args);
+    jsonOk(['logs' => $stmt->fetchAll()]);
+}
+
+// ── GET ?action=battery_log&user_id=X&limit=50 ──
+if ($action === 'battery_log') {
+    $uid   = (int)($_GET['user_id'] ?? 0);
+    $limit = min((int)($_GET['limit'] ?? 50), 200);
+    $where = $uid ? 'WHERE b.user_id = ?' : 'WHERE 1=1';
+    $args  = $uid ? [$uid] : [];
+
+    $stmt = $pdo->prepare(
+        "SELECT b.id, b.user_id, b.device_id, b.battery_pct, b.is_charging,
+                b.charging_time, b.discharging_time, b.ping_time,
+                u.name AS user_name, u.device_name
+           FROM battery_logs b
+           JOIN users u ON u.id = b.user_id
+           $where
+          ORDER BY b.ping_time DESC
+          LIMIT $limit"
+    );
+    $stmt->execute($args);
+    jsonOk(['battery_logs' => $stmt->fetchAll()]);
+}
+
+// ── GET ?action=alerts&limit=50 ──
+if ($action === 'alerts') {
+    $limit = min((int)($_GET['limit'] ?? 50), 200);
+    $alerts = $pdo->query(
+        "SELECT a.id, a.type, a.user_id, a.message, a.lat, a.lng,
+                a.battery_pct, a.is_read, a.created_at,
+                u.name AS user_name
+           FROM alerts a
+           LEFT JOIN users u ON u.id = a.user_id
+          ORDER BY a.created_at DESC
+          LIMIT $limit"
+    )->fetchAll();
+    jsonOk(['alerts' => $alerts]);
+}
+
+// ── POST ?action=mark_alerts_read ──
+if ($action === 'mark_alerts_read' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $pdo->exec('UPDATE alerts SET is_read = 1');
+    jsonOk(['msg' => 'All alerts marked as read']);
+}
+
+// ── GET ?action=geofences ──
+if ($action === 'geofences') {
+    $zones = $pdo->query('SELECT * FROM geofence_zones WHERE is_active = 1 ORDER BY created_at DESC')->fetchAll();
+    jsonOk(['zones' => $zones]);
+}
+
+// ── POST ?action=add_zone ──
+if ($action === 'add_zone' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $body  = json_decode(file_get_contents('php://input'), true) ?? [];
+    $name  = trim($body['name'] ?? '');
+    $lat   = (float)($body['lat'] ?? 0);
+    $lng   = (float)($body['lng'] ?? 0);
+    $rad   = max(50, min((int)($body['radius'] ?? 200), 50000));
+    $email = trim($body['alert_email'] ?? '');
+
+    if (!$name || !$lat || !$lng) jsonErr('name, lat, lng are required');
+
+    $pdo->prepare(
+        'INSERT INTO geofence_zones (admin_id, name, lat_center, lng_center, radius_m, alert_email)
+         VALUES (?,?,?,?,?,?)'
+    )->execute([$admin['id'], $name, $lat, $lng, $rad, $email]);
+
+    jsonOk(['msg' => "Zone \"{$name}\" added", 'id' => (int)$pdo->lastInsertId()]);
+}
+
+// ── POST ?action=delete_zone&id=X ──
+if ($action === 'delete_zone' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $id = (int)($_GET['id'] ?? 0);
+    if (!$id) jsonErr('Zone ID required');
+    $pdo->prepare('UPDATE geofence_zones SET is_active = 0 WHERE id = ?')->execute([$id]);
+    jsonOk(['msg' => 'Zone deleted']);
+}
+
+// ── POST ?action=remove_user&id=X ──
+if ($action === 'remove_user' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $id = (int)($_GET['id'] ?? 0);
+    if (!$id) jsonErr('User ID required');
+    $pdo->prepare('UPDATE users SET is_active = 0 WHERE id = ?')->execute([$id]);
+    jsonOk(['msg' => 'User deactivated']);
+}
+
+// ── GET ?action=cleanup_log ──
+if ($action === 'cleanup_log') {
+    $rows = $pdo->query('SELECT * FROM cleanup_log ORDER BY cleaned_at DESC LIMIT 20')->fetchAll();
+    jsonOk(['cleanup_log' => $rows]);
+}
+
+jsonErr('Unknown action', 400);
