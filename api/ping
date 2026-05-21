@@ -1,1 +1,117 @@
+<?php
+// api/ping.php — Receives GPS + battery data every 10 minutes from user devices
+require_once __DIR__ . '/../includes/config.php';
 
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') jsonErr('POST required', 405);
+
+$user = requireUser();
+$body = json_decode(file_get_contents('php://input'), true) ?? [];
+
+// ── Validate coordinates ──
+$lat = isset($body['lat']) ? (float)$body['lat'] : null;
+$lng = isset($body['lng']) ? (float)$body['lng'] : null;
+
+if ($lat === null || $lng === null) jsonErr('lat and lng are required');
+if ($lat < -90  || $lat > 90)      jsonErr('Invalid latitude');
+if ($lng < -180 || $lng > 180)     jsonErr('Invalid longitude');
+
+// ── Optional fields ──
+$accuracy         = isset($body['accuracy'])          ? (float)$body['accuracy']          : null;
+$altitude         = isset($body['altitude'])          ? (float)$body['altitude']          : null;
+$speed            = isset($body['speed'])             ? (float)$body['speed']             : null;
+$heading          = isset($body['heading'])           ? (float)$body['heading']           : null;
+$battery_pct      = isset($body['battery_pct'])       ? (int)$body['battery_pct']         : null;
+$is_charging      = isset($body['is_charging'])       ? (int)(bool)$body['is_charging']   : null;
+$charging_time    = isset($body['charging_time'])     ? (int)$body['charging_time']       : null;
+$discharging_time = isset($body['discharging_time'])  ? (int)$body['discharging_time']    : null;
+$network_type     = trim($body['network_type'] ?? '');
+$ip               = $_SERVER['REMOTE_ADDR'] ?? '';
+$ua               = $_SERVER['HTTP_USER_AGENT'] ?? '';
+
+$pdo = db();
+
+// ── 1. CLEANUP old location logs (every 1 HOUR) — runs BEFORE insert ──
+$deleted = $pdo->exec(
+    "DELETE FROM location_logs WHERE recorded_at < NOW() - INTERVAL " . LOCATION_RETAIN_HOURS . " HOUR"
+);
+if ($deleted > 0) {
+    $pdo->prepare('INSERT INTO cleanup_log (rows_deleted) VALUES (?)')->execute([$deleted]);
+}
+
+// ── 2. Insert fresh location log ──
+$pdo->prepare(
+    'INSERT INTO location_logs
+      (user_id, device_id, latitude, longitude, accuracy_m, altitude_m,
+       speed_ms, heading_deg, battery_pct, is_charging, charging_time,
+       discharging_time, network_type, ip_address, user_agent)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)'
+)->execute([
+    $user['id'], $user['device_id'], $lat, $lng, $accuracy, $altitude,
+    $speed, $heading, $battery_pct, $is_charging, $charging_time,
+    $discharging_time, $network_type, $ip, $ua,
+]);
+
+$pingId = (int)$pdo->lastInsertId();
+
+// ── 3. Insert battery log ──
+if ($battery_pct !== null) {
+    $pdo->prepare(
+        'INSERT INTO battery_logs
+          (user_id, device_id, battery_pct, is_charging, charging_time, discharging_time)
+         VALUES (?,?,?,?,?,?)'
+    )->execute([
+        $user['id'], $user['device_id'],
+        $battery_pct, $is_charging ?? 0,
+        $charging_time, $discharging_time,
+    ]);
+}
+
+// ── 4. Update users.last_* ──
+$pdo->prepare(
+    'UPDATE users SET last_seen = NOW(), last_lat = ?, last_lng = ?, last_battery = ?, tracking_active = 1 WHERE id = ?'
+)->execute([$lat, $lng, $battery_pct, $user['id']]);
+
+// ── 5. Geofence checks ──
+$zones    = $pdo->query('SELECT * FROM geofence_zones WHERE is_active = 1')->fetchAll();
+$breaches = [];
+foreach ($zones as $z) {
+    $dist = haversineM($lat, $lng, (float)$z['lat_center'], (float)$z['lng_center']);
+    if ($dist <= (float)$z['radius_m']) {
+        $msg = "User {$user['name']} entered zone \"{$z['name']}\" (~{$dist}m from center)";
+        $pdo->prepare(
+            'INSERT INTO alerts (type, user_id, message, lat, lng, battery_pct) VALUES (?,?,?,?,?,?)'
+        )->execute(['geofence_breach', $user['id'], $msg, $lat, $lng, $battery_pct]);
+        $breaches[] = $z['name'];
+    }
+}
+
+// ── 6. Low-battery alert (≤15%) ──
+if ($battery_pct !== null && $battery_pct <= 15) {
+    $recent = $pdo->prepare(
+        "SELECT id FROM alerts WHERE user_id=? AND type='low_battery' AND created_at > NOW() - INTERVAL 30 MINUTE"
+    );
+    $recent->execute([$user['id']]);
+    if (!$recent->fetch()) {
+        $msg = "Low battery {$battery_pct}% on {$user['device_name']} ({$user['name']})";
+        $pdo->prepare(
+            'INSERT INTO alerts (type, user_id, message, lat, lng, battery_pct) VALUES (?,?,?,?,?,?)'
+        )->execute(['low_battery', $user['id'], $msg, $lat, $lng, $battery_pct]);
+    }
+}
+
+jsonOk([
+    'ping_id'           => $pingId,
+    'battery_pct'       => $battery_pct,
+    'geofence_breaches' => $breaches,
+    'rows_cleaned'      => (int)$deleted,
+    'server_time'       => date('c'),
+]);
+
+// ── Haversine distance in metres ──
+function haversineM(float $lat1, float $lng1, float $lat2, float $lng2): float {
+    $R    = 6371000;
+    $dLat = deg2rad($lat2 - $lat1);
+    $dLng = deg2rad($lng2 - $lng1);
+    $a    = sin($dLat/2)**2 + cos(deg2rad($lat1)) * cos(deg2rad($lat2)) * sin($dLng/2)**2;
+    return (float)round($R * 2 * atan2(sqrt($a), sqrt(1 - $a)));
+}
