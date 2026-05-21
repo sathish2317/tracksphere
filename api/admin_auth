@@ -1,1 +1,91 @@
+<?php
+// api/admin_auth.php — Admin login / register / logout / validate
+require_once __DIR__ . '/../includes/config.php';
 
+$body   = json_decode(file_get_contents('php://input'), true) ?? [];
+$action = $_GET['action'] ?? $body['action'] ?? '';
+
+// ─────────────────────────────────────────────
+//  GET /api/admin_auth.php?action=validate
+// ─────────────────────────────────────────────
+if ($action === 'validate' && $_SERVER['REQUEST_METHOD'] === 'GET') {
+    $token = $_SERVER['HTTP_X_SESSION_TOKEN'] ?? ($_COOKIE['ts_admin_token'] ?? '');
+    if (!$token) jsonErr('Unauthorized', 401);
+    $row = db()->prepare('SELECT id, name, email FROM admins WHERE session_token = ? AND session_expires > NOW() AND is_active = 1');
+    $row->execute([$token]);
+    $admin = $row->fetch();
+    if (!$admin) jsonErr('Session expired', 401);
+    jsonOk(['name' => $admin['name'], 'email' => $admin['email'], 'role' => 'admin']);
+}
+
+// ─────────────────────────────────────────────
+//  POST /api/admin_auth.php?action=register
+// ─────────────────────────────────────────────
+if ($action === 'register' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $name  = trim($body['name']  ?? '');
+    $email = trim($body['email'] ?? '');
+    $pass  = trim($body['pass']  ?? $body['password'] ?? '');
+    $key   = trim($body['admin_key'] ?? '');
+
+    if ($key !== ADMIN_REGISTER_KEY) jsonErr('Invalid admin registration key');
+    if (!$name || !$email || !$pass) jsonErr('All fields required');
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) jsonErr('Invalid email address');
+    if (strlen($pass) < 8) jsonErr('Password must be at least 8 characters');
+
+    $hash = password_hash($pass, PASSWORD_BCRYPT, ['cost' => 12]);
+    try {
+        db()->prepare('INSERT INTO admins (name, email, password_hash) VALUES (?, ?, ?)')
+             ->execute([$name, $email, $hash]);
+        jsonOk(['msg' => 'Admin account created. You can now sign in.']);
+    } catch (PDOException $e) {
+        if ($e->getCode() === '23000') jsonErr('Email already registered');
+        jsonErr('Database error: ' . $e->getMessage());
+    }
+}
+
+// ─────────────────────────────────────────────
+//  POST /api/admin_auth.php?action=login
+// ─────────────────────────────────────────────
+if ($action === 'login' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $email = trim($body['email'] ?? '');
+    $pass  = trim($body['pass']  ?? '');
+
+    if (!$email || !$pass) jsonErr('Email and password required');
+
+    $stmt = db()->prepare('SELECT * FROM admins WHERE email = ? AND is_active = 1');
+    $stmt->execute([$email]);
+    $admin = $stmt->fetch();
+
+    if (!$admin || !password_verify($pass, $admin['password_hash'])) {
+        jsonErr('Invalid credentials');
+    }
+
+    $token   = generateToken(32);
+    $expires = date('Y-m-d H:i:s', time() + SESSION_LIFETIME);
+
+    db()->prepare('UPDATE admins SET session_token = ?, session_expires = ?, last_login = NOW() WHERE id = ?')
+        ->execute([$token, $expires, $admin['id']]);
+
+    setcookie('ts_admin_token', $token, time() + SESSION_LIFETIME, '/', '', false, true);
+
+    jsonOk([
+        'token'   => $token,
+        'name'    => $admin['name'],
+        'email'   => $admin['email'],
+        'role'    => 'admin',
+        'expires' => $expires,
+    ]);
+}
+
+// ─────────────────────────────────────────────
+//  POST /api/admin_auth.php?action=logout
+// ─────────────────────────────────────────────
+if ($action === 'logout' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $admin = requireAdmin();
+    db()->prepare('UPDATE admins SET session_token = NULL, session_expires = NULL WHERE id = ?')
+        ->execute([$admin['id']]);
+    setcookie('ts_admin_token', '', time() - 3600, '/');
+    jsonOk(['msg' => 'Logged out successfully']);
+}
+
+jsonErr('Unknown action or method', 400);
